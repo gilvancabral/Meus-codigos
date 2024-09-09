@@ -1,0 +1,226 @@
+#region Using declarations
+// Importa bibliotecas necessárias para diversas funcionalidades.
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.ComponentModel.DataAnnotations;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Input;
+using System.Windows.Media;
+using System.Xml.Serialization;
+using NinjaTrader.Cbi;
+using NinjaTrader.Gui;
+using NinjaTrader.Gui.Chart;
+using NinjaTrader.Gui.SuperDom;
+using NinjaTrader.Gui.Tools;
+using NinjaTrader.Data;
+using NinjaTrader.NinjaScript;
+using NinjaTrader.Core.FloatingPoint;
+using NinjaTrader.NinjaScript.DrawingTools;
+#endregion
+
+// Este namespace contém os indicadores dessa pasta e é obrigatório.
+namespace NinjaTrader.NinjaScript.Indicators
+{
+	// Classe principal do indicador.
+	public class AntoQQE : Indicator
+	{
+		// Séries para armazenar valores calculados.
+		Series<double> Rsi;  // Série que armazena o valor do RSI.
+		Series<double> RsiMa; // Média móvel do RSI.
+		Series<double> AtrRsi; // ATR do RSI, utilizado no cálculo da volatilidade.
+		Series<double> MatrRsi; // Média móvel do ATR do RSI.
+		Series<double> dar; // Valor multiplicado pelo fator QQE para calcular as bandas.
+		Series<double> shortband; // Banda inferior baseada no RSI suavizado.
+		Series<double> longband; // Banda superior baseada no RSI suavizado.
+		Series<double> trend; // Indica a direção da tendência (1 = alta, -1 = baixa).
+		
+		double newShortband = 0.0; // Novo valor calculado da banda inferior.
+		double newLongband = 0.0; // Novo valor calculado da banda superior.
+		
+		// Método que define o estado do indicador.
+		protected override void OnStateChange()
+		{
+			// Estado inicial, define os parâmetros padrão.
+			if (State == State.SetDefaults)
+			{
+				Description = @"Enter the description for your new custom Indicator here."; // Descrição do indicador.
+				Name = "AntoQQE"; // Nome do indicador.
+				RSI_Period = 6; // Período padrão do RSI.
+				SF = 6; // Fator suavizador.
+				QQE = 4.238; // Fator QQE para ajustar a sensibilidade.
+				Threshhold = 10; // Limite de variação para exibir cores no gráfico.
+				thicknes = 4; // Espessura das barras do gráfico.
+				Calculate = Calculate.OnBarClose; // Define o cálculo no fechamento de cada barra.
+				IsOverlay = false; // Indica se o indicador será exibido sobre o gráfico de preço.
+				DisplayInDataBox = true; // Exibe os dados na caixa de informações.
+				DrawOnPricePanel = true; // Desenha o indicador no painel de preço.
+				DrawHorizontalGridLines = true; // Desenha linhas horizontais no gráfico.
+				DrawVerticalGridLines = true; // Desenha linhas verticais no gráfico.
+				PaintPriceMarkers = true; // Exibe marcadores de preço.
+				ScaleJustification = NinjaTrader.Gui.Chart.ScaleJustification.Right; // Justificação da escala.
+				IsSuspendedWhileInactive = true; // Suspende o cálculo quando inativo.
+			}
+			else if (State == State.Configure)
+			{
+				// Configuração das séries para armazenar os valores calculados.
+				Rsi = new Series<double>(this);
+				RsiMa = new Series<double>(this);
+				AtrRsi = new Series<double>(this);
+				MatrRsi = new Series<double>(this);
+				dar = new Series<double>(this);
+				
+				shortband = new Series<double>(this); // Inicializa a série da banda inferior.
+				longband = new Series<double>(this); // Inicializa a série da banda superior.
+				trend = new Series<double>(this); // Inicializa a série de tendência.
+				
+				// Adiciona as linhas e gráficos que serão exibidos.
+				AddPlot(new Stroke(Brushes.Black, 3), PlotStyle.Line, "plot1t"); // Plota a primeira linha no gráfico.
+				AddPlot(new Stroke(Brushes.Black, 3), PlotStyle.Line, "plot2t"); // Plota a segunda linha no gráfico.
+				AddPlot(new Stroke(Brushes.DodgerBlue, thicknes), PlotStyle.Bar, "plot3t"); // Plota as barras.
+				AddLine(Brushes.Blue, Threshhold, "Up"); // Linha limite superior (azul).
+				AddLine(Brushes.Red, -Threshhold, "Down"); // Linha limite inferior (vermelha).
+			}
+		}
+
+		// Método que executa o cálculo do indicador a cada nova barra.
+		protected override void OnBarUpdate()
+		{
+			// Lógica inicial para barras recentes.
+			if(CurrentBar == 1){				
+				RsiMa[0] = 0;
+				longband[0] = 0;
+				shortband[0] = 0;
+				trend[0] = 0;
+			}
+
+			// Garantir que o número de barras seja suficiente para os cálculos.
+			if(CurrentBar < 2*RSI_Period -1)
+				return;
+			
+			// Cálculo do RSI e suas médias móveis.
+			Rsi[0] =  RSI(Close, RSI_Period, 1)[0]; // Calcula o RSI.
+			RsiMa[0] = EMA(Rsi, SF)[0]; // Calcula a média móvel exponencial do RSI.
+			AtrRsi[0] = Math.Abs(RsiMa[1] - RsiMa[0]); // Calcula o ATR do RSI.
+			MatrRsi[0] = EMA(AtrRsi, 2*RSI_Period -1)[0]; // Média do ATR.
+			dar[0] = EMA(MatrRsi, 2*RSI_Period -1)[0] * QQE; // Aplica o fator QQE no cálculo das bandas.
+			
+			// Cálculo das novas bandas baseadas no RSI suavizado.
+			newShortband = RsiMa[0] + dar[0]; // Banda inferior.
+			newLongband = RsiMa[0] - dar[0]; // Banda superior.
+			
+			// Verifica e ajusta as bandas superior e inferior de acordo com a tendência.
+			if(RsiMa[1] > longband[1] && RsiMa[0] > longband[1]){				
+				longband[0] = Math.Max(longband[1], newLongband);				
+			} else {				
+				longband[0] = newLongband;
+			}
+			
+			if(RsiMa[1] < shortband[1] && RsiMa[0] < shortband[1]){				
+				shortband[0] = Math.Min(shortband[1], newShortband);				
+			} else {				
+				shortband[0] = newShortband;
+			}
+			
+			// Determinação da tendência com base no cruzamento do RSI com as bandas.
+			if((RsiMa[0] > longband[1] && RsiMa[1] < longband[1]) || (RsiMa[0] < longband[1] && RsiMa[1] > longband[1])){				
+				trend[0] = 1; // Tendência de alta.
+			} else if((RsiMa[0] > shortband[1] && RsiMa[1] < shortband[1]) || (RsiMa[0] < shortband[1] && RsiMa[1] > shortband[1])){				
+				trend[0] = -1; // Tendência de baixa.
+			}
+			
+			if(trend[1] != 0){	
+				trend[0] = trend[1]; // Mantém a tendência anterior, se não for neutra.
+			} else {
+				trend[0] = 1; // Se não houver tendência anterior, define como alta.
+			}
+
+			// Ajuste dos valores baseados na tendência.
+			if(trend[0] == 1){				
+				Rsi_index1[0] = longband[0] - 50;
+				FastAtrrsi1[0] = RsiMa[0] - 50;				
+			} else {				
+				Rsi_index1[0] = shortband[0] - 50;
+				FastAtrrsi1[0] = RsiMa[0] - 50;
+			}
+			
+			// Calcula o valor do histograma.
+			hist[0] = RsiMa[0] - 50;
+			// Define a cor dos candles e da linha de acordo com a distância do histograma ao limite.
+			if(hist[0] < 10 && hist[0] > -10){
+				PlotBrushes[2][0] = Brushes.Gray; // Cor do histograma.
+				BarBrush = Brushes.Orange; // Cor dos candles.
+				CandleOutlineBrushes[0] = BarBrush; // Cor do contorno dos candles.
+			} else if(hist[0] < -10){				
+				PlotBrushes[2][0] = Brushes.Blue; // Cor do histograma em tendência de alta.
+				BarBrush = Brushes.Green; // Cor dos candles em alta.
+				CandleOutlineBrushes[0] = BarBrush; // Cor do contorno dos candles.
+			} else if(hist[0] > 10){
+				PlotBrushes[2][0] = Brushes.Red; // Cor do histograma em tendência de baixa.
+				BarBrush = Brushes.Red; // Cor dos candles em baixa.
+				CandleOutlineBrushes[0] = BarBrush; // Cor do contorno dos candles.
+			}
+		}
+	}
+}
+
+
+#region NinjaScript generated code. Neither change nor remove.
+
+namespace NinjaTrader.NinjaScript.Indicators
+{
+	public partial class Indicator : NinjaTrader.Gui.NinjaScript.IndicatorRenderBase
+	{
+		private AntoQQE[] cacheAntoQQE;
+		public AntoQQE AntoQQE()
+		{
+			return AntoQQE(Input);
+		}
+
+		public AntoQQE AntoQQE(ISeries<double> input)
+		{
+			if (cacheAntoQQE != null)
+				for (int idx = 0; idx < cacheAntoQQE.Length; idx++)
+					if (cacheAntoQQE[idx] != null &&  cacheAntoQQE[idx].EqualsInput(input))
+						return cacheAntoQQE[idx];
+			return CacheIndicator<AntoQQE>(new AntoQQE(), input, ref cacheAntoQQE);
+		}
+	}
+}
+
+namespace NinjaTrader.NinjaScript.MarketAnalyzerColumns
+{
+	public partial class MarketAnalyzerColumn : MarketAnalyzerColumnBase
+	{
+		public Indicators.AntoQQE AntoQQE()
+		{
+			return indicator.AntoQQE(Input);
+		}
+
+		public Indicators.AntoQQE AntoQQE(ISeries<double> input )
+		{
+			return indicator.AntoQQE(input);
+		}
+	}
+}
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+	public partial class Strategy : NinjaTrader.Gui.NinjaScript.StrategyRenderBase
+	{
+		public Indicators.AntoQQE AntoQQE()
+		{
+			return indicator.AntoQQE(Input);
+		}
+
+		public Indicators.AntoQQE AntoQQE(ISeries<double> input )
+		{
+			return indicator.AntoQQE(input);
+		}
+	}
+}
+
+#endregion
