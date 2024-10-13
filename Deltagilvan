@@ -1,0 +1,674 @@
+#region Using declarations
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.ComponentModel.DataAnnotations;
+using System.Windows.Media;
+using System.Xml.Serialization;
+using NinjaTrader.Cbi;
+using NinjaTrader.Data;
+using NinjaTrader.Gui;
+using NinjaTrader.Gui.Chart;
+using NinjaTrader.NinjaScript;
+using NinjaTrader.NinjaScript.DrawingTools;
+using NinjaTrader.NinjaScript.Indicators;
+#endregion
+/*-------------------------------------------------------------------
+Indicator: Deltagilvan
+Version: 1.0
+Date: [Coloque a data atual]
+
+Changelog:
+- Implementação inicial do indicador Deltagilvan.
+- Cálculo do delta de volume com opção de delta acumulado.
+- Inclusão de Bandas de Bollinger e EMA do delta.
+- Opção de coloração das barras com base em regras específicas.
+- Possibilidade de exibir divergências do delta acumulado.
+-------------------------------------------------------------------*/
+
+// Este namespace contém os indicadores nesta pasta e é necessário. Não o altere.
+namespace NinjaTrader.NinjaScript.Indicators
+{
+    public class Deltagilvan : Indicator
+    {
+        private double buys = 1;
+        private double sells = 1;
+        private double cdHigh = 1;
+        private double cdLow = 1;
+        private double cdOpen = 1;
+        private double cdClose = 1;
+        private int barPaintWidth;
+        private Dictionary<string, DXMediaMap> dxmBrushes;
+        private SharpDX.RectangleF reuseRect;
+        private SharpDX.Vector2 reuseVector1, reuseVector2;
+        private int x, y1, y2, y3, y4;
+        private Series<double> delta_open;
+        private Series<double> delta_close;
+        private Series<double> delta_high;
+        private Series<double> delta_low;
+
+        private Bollinger bollinger; // Bandas de Bollinger
+        private EMA deltaEMA;        // EMA do delta
+
+        private bool isReset;
+
+        private int lastBar;
+        private bool lastInTransition;
+
+        private Brush divergeCandleup = Brushes.Purple;    // Cor para divergência de alta
+        private Brush divergeCandledown = Brushes.Pink;    // Cor para divergência de baixa
+
+        protected override void OnStateChange()
+        {
+            if (State == State.SetDefaults)
+            {
+                Description = @"Volume Delta by Gill";
+                Name = "Deltagilvan";
+                Calculate = Calculate.OnEachTick;
+                IsOverlay = false;
+                DisplayInDataBox = true;
+                DrawOnPricePanel = false;
+                DrawHorizontalGridLines = true;
+                DrawVerticalGridLines = true;
+                PaintPriceMarkers = true;
+                ScaleJustification = ScaleJustification.Right;
+                IsSuspendedWhileInactive = false;
+
+                MaximumBarsLookBack = MaximumBarsLookBack.Infinite;
+
+                dxmBrushes = new Dictionary<string, DXMediaMap>();
+                foreach (string brushName in new string[] { "barColorDown", "barColorUp", "shadowColor" })
+                    dxmBrushes.Add(brushName, new DXMediaMap());
+
+                BarColorDown = Brushes.Red;
+                BarColorUp = Brushes.LimeGreen;
+                ShadowColor = Brushes.Black;
+                ShadowWidth = 1;
+                MinSize = 0;
+                CumulativeDelta = false;
+                ShowDivs = false;
+
+                // Valores padrão atualizados
+                BBPeriod = 200; // Período padrão das Bandas de Bollinger
+                BBStdDev = 1;   // Desvio padrão padrão das Bandas de Bollinger
+                EMAPeriod = 17; // Período padrão da EMA
+
+                // Cores para coloração das barras
+                ColorAboveUpperBand = Brushes.Green;
+                ColorBelowLowerBand = Brushes.Red;
+                ColorInsideBands = Brushes.White;
+
+                ApplyColoringToIndicator = true;
+                ApplyColoringToPriceChart = false;
+                ShowBollingerBands = true;
+                ShowEMA = true;
+
+                AddPlot(new Stroke(Brushes.Transparent), PlotStyle.PriceBox, "DeltaOpen");
+                AddPlot(new Stroke(Brushes.Transparent), PlotStyle.PriceBox, "DeltaHigh");
+                AddPlot(new Stroke(Brushes.Transparent), PlotStyle.PriceBox, "DeltaLow");
+                AddPlot(new Stroke(Brushes.Orange), PlotStyle.PriceBox, "DeltaClose");
+
+                // Plots para as Bandas de Bollinger
+                AddPlot(Brushes.Blue, "UpperBand");
+                AddPlot(Brushes.Gray, "MiddleBand");
+                AddPlot(Brushes.Blue, "LowerBand");
+
+                // Plot para a EMA
+                AddPlot(Brushes.Magenta, "DeltaEMA");
+
+            }
+            else if (State == State.Configure)
+            {
+                AddDataSeries(BarsPeriodType.Tick, 1);
+            }
+            else if (State == State.DataLoaded)
+            {
+                delta_open = new Series<double>(this);
+                delta_close = new Series<double>(this);
+                delta_high = new Series<double>(this);
+                delta_low = new Series<double>(this);
+
+                bollinger = Bollinger(delta_close, BBStdDev, BBPeriod); // Inicializa as Bandas de Bollinger
+                deltaEMA = EMA(delta_close, EMAPeriod);                 // Inicializa a EMA do delta
+            }
+        }
+
+        protected override void OnBarUpdate()
+        {
+            if (CurrentBars[0] < Math.Max(EMAPeriod, BBPeriod) || CurrentBars[1] < 5)
+                return;
+
+            if (BarsInProgress == 0)
+            {
+                int indexOffset = BarsArray[1].Count - 1 - CurrentBars[1];
+
+                if (IsFirstTickOfBar && Calculate != Calculate.OnBarClose && (State == State.Realtime || BarsArray[0].IsTickReplay))
+                {
+                    if (CurrentBars[0] > 0)
+                        SetValues(1);
+
+                    if (BarsArray[0].IsTickReplay || State == State.Realtime && indexOffset == 0)
+                        ResetValues(false, cdClose);
+                }
+
+                SetValues(0);
+
+                if (Calculate == Calculate.OnBarClose || (lastBar != CurrentBars[0] && (State == State.Historical || State == State.Realtime && indexOffset > 0)))
+                    ResetValues(false, cdClose);
+
+                lastBar = CurrentBars[0];
+
+                // Calcula as Bandas de Bollinger
+                if (CurrentBar >= BBPeriod)
+                {
+                    Values[4][0] = bollinger.Upper[0];  // UpperBand
+                    Values[5][0] = bollinger.Middle[0]; // MiddleBand
+                    Values[6][0] = bollinger.Lower[0];  // LowerBand
+                }
+
+                // Calcula a EMA do delta
+                if (CurrentBar >= EMAPeriod)
+                {
+                    Values[7][0] = deltaEMA[0]; // DeltaEMA
+                }
+
+                // Aplicação da regra de coloração
+                if (CurrentBar >= BBPeriod)
+                {
+                    Brush barBrush = null;
+
+                    if (delta_close[0] > bollinger.Upper[0])
+                    {
+                        barBrush = ColorAboveUpperBand;
+                    }
+                    else if (delta_close[0] < bollinger.Lower[0])
+                    {
+                        barBrush = ColorBelowLowerBand;
+                    }
+                    else
+                    {
+                        barBrush = ColorInsideBands;
+                    }
+
+                    // Aplica a coloração ao indicador se habilitado
+                    if (ApplyColoringToIndicator)
+                    {
+                        PlotBrushes[3][0] = barBrush;
+                    }
+
+                    // Aplica a coloração ao gráfico de preços se habilitado
+                    if (ApplyColoringToPriceChart)
+                    {
+                        BarBrushes[0] = barBrush;
+                    }
+                }
+                else
+                {
+                    // Coloração das barras de acordo com o Delta (se não usar a coloração das bandas)
+                    if (ApplyColoringToIndicator)
+                    {
+                        if (CumulativeDelta)
+                        {
+                            if (delta_close[0] > delta_close[1]) PlotBrushes[3][0] = BarColorUp;
+                            else if (delta_close[0] < delta_close[1]) PlotBrushes[3][0] = BarColorDown;
+                            else PlotBrushes[3][0] = Brushes.Orange;
+                        }
+                        else
+                        {
+                            if (delta_close[0] > 0) PlotBrushes[3][0] = BarColorUp;
+                            else if (delta_close[0] < 0) PlotBrushes[3][0] = BarColorDown;
+                            else PlotBrushes[3][0] = Brushes.Orange;
+                        }
+                    }
+                }
+
+                // Ocultar as Bandas de Bollinger se necessário
+                if (!ShowBollingerBands)
+                {
+                    PlotBrushes[4][0] = Brushes.Transparent; // UpperBand
+                    PlotBrushes[5][0] = Brushes.Transparent; // MiddleBand
+                    PlotBrushes[6][0] = Brushes.Transparent; // LowerBand
+                }
+
+                // Ocultar a EMA se necessário
+                if (!ShowEMA)
+                {
+                    PlotBrushes[7][0] = Brushes.Transparent; // DeltaEMA
+                }
+
+                if (IsFirstTickOfBar && ShowDivs)
+                {
+                    if (CumulativeDelta && delta_low[1] >= delta_low[2] && Low[1] <= Low[2] && Low[1] <= Low[3])
+                    {
+                        Draw.TriangleUp(this, "BullDiv" + CurrentBar, true, 1, Low[1] - 2 * TickSize, divergeCandleup);
+                    }
+
+                    if (CumulativeDelta && delta_high[1] <= delta_high[2] && High[1] >= High[2] && High[1] >= High[3])
+                    {
+                        Draw.TriangleDown(this, "BearDiv" + CurrentBar, true, 1, High[1] + 2 * TickSize, divergeCandledown);
+                    }
+                }
+
+            }
+            else if (BarsInProgress == 1)
+            {
+                if (BarsArray[1].IsFirstBarOfSession)
+                    ResetValues(true, cdClose);
+
+                CalculateValues(false);
+            }
+        }
+
+        private void CalculateValues(bool forceCurrentBar)
+        {
+            int indexOffset = BarsArray[1].Count - 1 - CurrentBars[1];
+            bool inTransition = State == State.Realtime && indexOffset > 1;
+            if (!inTransition && lastInTransition && !forceCurrentBar && Calculate == Calculate.OnBarClose)
+                CalculateValues(true);
+
+            bool useCurrentBar = State == State.Historical || inTransition || Calculate != Calculate.OnBarClose || forceCurrentBar;
+            int whatBar = useCurrentBar ? CurrentBars[1] : Math.Min(CurrentBars[1] + 1, BarsArray[1].Count - 1);
+
+            double volume = BarsArray[1].GetVolume(whatBar);
+            double price = BarsArray[1].GetClose(whatBar);
+
+            if (price >= BarsArray[1].GetAsk(whatBar) && volume >= MinSize)
+                buys += volume;
+            else if (price <= BarsArray[1].GetBid(whatBar) && volume >= MinSize)
+                sells += volume;
+
+            cdClose = buys - sells;
+
+            if (cdClose > cdHigh)
+                cdHigh = cdClose;
+
+            if (cdClose < cdLow)
+                cdLow = cdClose;
+
+            lastInTransition = inTransition;
+        }
+
+        private void SetValues(int barsAgo)
+        {
+            Values[0][barsAgo] = delta_open[barsAgo] = cdOpen;
+            Values[1][barsAgo] = delta_high[barsAgo] = cdHigh;
+            Values[2][barsAgo] = delta_low[barsAgo] = cdLow;
+            Values[3][barsAgo] = delta_close[barsAgo] = cdClose;
+        }
+
+        private void ResetValues(bool isNewSession, double openlevel)
+        {
+            if (CumulativeDelta)
+            {
+                cdOpen = cdClose = cdHigh = cdLow = openlevel;
+            }
+            if (!CumulativeDelta)
+            {
+                cdOpen = cdClose = cdHigh = cdLow = buys = sells = 0;
+            }
+            if (isNewSession)
+            {
+                cdOpen = cdClose = cdHigh = cdLow = buys = sells = 0;
+            }
+            isReset = true;
+        }
+
+        public override string DisplayName
+        {
+            get { return "Deltagilvan"; }
+        }
+
+        #region Miscellaneous
+
+        protected override void OnRender(ChartControl chartControl, ChartScale chartScale)
+        {
+            base.OnRender(chartControl, chartScale);
+
+            barPaintWidth = Math.Max(3, 1 + 2 * ((int)ChartBars.Properties.ChartStyle.BarWidth - 1) + 2 * ShadowWidth);
+
+            for (int idx = ChartBars.FromIndex; idx <= ChartBars.ToIndex; idx++)
+            {
+                if (idx - Displacement < 0 || idx - Displacement >= BarsArray[0].Count || (idx - Displacement < BarsRequiredToPlot))
+                    continue;
+
+                x = chartControl.GetXByBarIndex(ChartBars, idx);
+                y1 = chartScale.GetYByValue(delta_open.GetValueAt(idx));
+                y2 = chartScale.GetYByValue(delta_high.GetValueAt(idx));
+                y3 = chartScale.GetYByValue(delta_low.GetValueAt(idx));
+                y4 = chartScale.GetYByValue(delta_close.GetValueAt(idx));
+
+                reuseVector1.X = x;
+                reuseVector1.Y = y2;
+                reuseVector2.X = x;
+                reuseVector2.Y = y3;
+
+                RenderTarget.DrawLine(reuseVector1, reuseVector2, dxmBrushes["shadowColor"].DxBrush);
+
+                if (y4 == y1)
+                {
+                    reuseVector1.X = (x - barPaintWidth / 2);
+                    reuseVector1.Y = y1;
+                    reuseVector2.X = (x + barPaintWidth / 2);
+                    reuseVector2.Y = y1;
+
+                    RenderTarget.DrawLine(reuseVector1, reuseVector2, dxmBrushes["shadowColor"].DxBrush);
+                }
+                else
+                {
+                    if (y4 > y1)
+                    {
+                        UpdateRect(ref reuseRect, (x - barPaintWidth / 2), y1, barPaintWidth, (y4 - y1));
+                        RenderTarget.FillRectangle(reuseRect, dxmBrushes["barColorDown"].DxBrush);
+                    }
+                    else
+                    {
+                        UpdateRect(ref reuseRect, (x - barPaintWidth / 2), y4, barPaintWidth, (y1 - y4));
+                        RenderTarget.FillRectangle(reuseRect, dxmBrushes["barColorUp"].DxBrush);
+                    }
+
+                    UpdateRect(ref reuseRect, ((x - barPaintWidth / 2) + (ShadowWidth / 2)), Math.Min(y4, y1), (barPaintWidth - ShadowWidth + 2), Math.Abs(y4 - y1));
+                    RenderTarget.DrawRectangle(reuseRect, dxmBrushes["shadowColor"].DxBrush);
+                }
+            }
+        }
+
+        public override void OnRenderTargetChanged()
+        {
+            try
+            {
+                foreach (KeyValuePair<string, DXMediaMap> item in dxmBrushes)
+                {
+                    if (item.Value.DxBrush != null)
+                        item.Value.DxBrush.Dispose();
+
+                    if (RenderTarget != null)
+                        item.Value.DxBrush = item.Value.MediaBrush.ToDxBrush(RenderTarget);
+                }
+            }
+            catch (Exception exception)
+            {
+                // Trate as exceções conforme necessário
+            }
+        }
+
+        private void UpdateRect(ref SharpDX.RectangleF updateRectangle, float x, float y, float width, float height)
+        {
+            updateRectangle.X = x;
+            updateRectangle.Y = y;
+            updateRectangle.Width = width;
+            updateRectangle.Height = height;
+        }
+
+        private void UpdateRect(ref SharpDX.RectangleF rectangle, int x, int y, int width, int height)
+        {
+            UpdateRect(ref rectangle, (float)x, (float)y, (float)width, (float)height);
+        }
+        #endregion
+
+        #region Propriedades
+
+        // Classe interna para mapear as brushes
+        [Browsable(false)]
+        public class DXMediaMap
+        {
+            public SharpDX.Direct2D1.Brush DxBrush;
+            public System.Windows.Media.Brush MediaBrush;
+        }
+
+        [NinjaScriptProperty]
+        [XmlIgnore]
+        [Display(Name = "Cor da Barra Baixa", Order = 4, GroupName = "Aparência")]
+        public Brush BarColorDown
+        {
+            get { return dxmBrushes["barColorDown"].MediaBrush; }
+            set { dxmBrushes["barColorDown"].MediaBrush = value; }
+        }
+
+        [Browsable(false)]
+        public string BarColorDownSerializable
+        {
+            get { return Serialize.BrushToString(BarColorDown); }
+            set { BarColorDown = Serialize.StringToBrush(value); }
+        }
+
+        [NinjaScriptProperty]
+        [XmlIgnore]
+        [Display(Name = "Cor da Barra Alta", Order = 5, GroupName = "Aparência")]
+        public Brush BarColorUp
+        {
+            get { return dxmBrushes["barColorUp"].MediaBrush; }
+            set { dxmBrushes["barColorUp"].MediaBrush = value; }
+        }
+
+        [Browsable(false)]
+        public string BarColorUpSerializable
+        {
+            get { return Serialize.BrushToString(BarColorUp); }
+            set { BarColorUp = Serialize.StringToBrush(value); }
+        }
+
+        [NinjaScriptProperty]
+        [XmlIgnore]
+        [Display(Name = "Cor da Sombra", Order = 6, GroupName = "Aparência")]
+        public Brush ShadowColor
+        {
+            get { return dxmBrushes["shadowColor"].MediaBrush; }
+            set { dxmBrushes["shadowColor"].MediaBrush = value; }
+        }
+
+        [Browsable(false)]
+        public string ShadowColorSerializable
+        {
+            get { return Serialize.BrushToString(ShadowColor); }
+            set { ShadowColor = Serialize.StringToBrush(value); }
+        }
+
+        [NinjaScriptProperty]
+        [Range(1, int.MaxValue)]
+        [Display(Name = "Largura da Sombra", Order = 7, GroupName = "Aparência")]
+        public int ShadowWidth
+        { get; set; }
+
+        [Browsable(false)]
+        [XmlIgnore]
+        public Series<double> DeltaOpen
+        {
+            get { return Values[0]; }
+        }
+
+        [Browsable(false)]
+        [XmlIgnore]
+        public Series<double> DeltaHigh
+        {
+            get { return Values[1]; }
+        }
+
+        [Browsable(false)]
+        [XmlIgnore]
+        public Series<double> DeltaLow
+        {
+            get { return Values[2]; }
+        }
+
+        [Browsable(false)]
+        [XmlIgnore]
+        public Series<double> DeltaClose
+        {
+            get { return Values[3]; }
+        }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Delta Acumulado", Description = "Habilitar Delta Acumulado", Order = 1, GroupName = "Parâmetros")]
+        public bool CumulativeDelta
+        { get; set; }
+
+        [Range(0, int.MaxValue)]
+        [NinjaScriptProperty]
+        [Display(Name = "Tamanho Mínimo", Description = "Filtragem por Tamanho", Order = 2, GroupName = "Parâmetros")]
+        public int MinSize
+        { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Mostrar Divergências", Description = "Mostrar Divergências do Delta Acumulado (Delta Acumulado deve estar habilitado)", Order = 3, GroupName = "Parâmetros")]
+        public bool ShowDivs
+        { get; set; }
+
+        // Propriedades das Bandas de Bollinger
+        [NinjaScriptProperty]
+        [Range(1, int.MaxValue)]
+        [Display(Name = "Período da Bollinger", Order = 8, GroupName = "Bandas de Bollinger")]
+        public int BBPeriod { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0.1, double.MaxValue)]
+        [Display(Name = "Desvio Padrão da Bollinger", Order = 9, GroupName = "Bandas de Bollinger")]
+        public double BBStdDev { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Mostrar Bandas de Bollinger", Order = 10, GroupName = "Bandas de Bollinger")]
+        public bool ShowBollingerBands { get; set; }
+
+        // Propriedades da EMA
+        [NinjaScriptProperty]
+        [Range(1, int.MaxValue)]
+        [Display(Name = "Período da EMA", Order = 11, GroupName = "EMA")]
+        public int EMAPeriod { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Mostrar EMA", Order = 12, GroupName = "EMA")]
+        public bool ShowEMA { get; set; }
+
+        // Propriedades para coloração
+        [NinjaScriptProperty]
+        [XmlIgnore]
+        [Display(Name = "Cor Acima da Banda Superior", Order = 1, GroupName = "Coloração")]
+        public Brush ColorAboveUpperBand { get; set; }
+
+        [Browsable(false)]
+        public string ColorAboveUpperBandSerializable
+        {
+            get { return Serialize.BrushToString(ColorAboveUpperBand); }
+            set { ColorAboveUpperBand = Serialize.StringToBrush(value); }
+        }
+
+        [NinjaScriptProperty]
+        [XmlIgnore]
+        [Display(Name = "Cor Abaixo da Banda Inferior", Order = 2, GroupName = "Coloração")]
+        public Brush ColorBelowLowerBand { get; set; }
+
+        [Browsable(false)]
+        public string ColorBelowLowerBandSerializable
+        {
+            get { return Serialize.BrushToString(ColorBelowLowerBand); }
+            set { ColorBelowLowerBand = Serialize.StringToBrush(value); }
+        }
+
+        [NinjaScriptProperty]
+        [XmlIgnore]
+        [Display(Name = "Cor Dentro das Bandas", Order = 3, GroupName = "Coloração")]
+        public Brush ColorInsideBands { get; set; }
+
+        [Browsable(false)]
+        public string ColorInsideBandsSerializable
+        {
+            get { return Serialize.BrushToString(ColorInsideBands); }
+            set { ColorInsideBands = Serialize.StringToBrush(value); }
+        }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Aplicar Coloração ao Gráfico de Preços", Order = 4, GroupName = "Coloração")]
+        public bool ApplyColoringToPriceChart { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Aplicar Coloração ao Indicador", Order = 5, GroupName = "Coloração")]
+        public bool ApplyColoringToIndicator { get; set; }
+
+        [Browsable(false)]
+        [XmlIgnore()]
+        public Series<double> DeltasOpen
+        {
+            get { return delta_open; }
+        }
+
+        [Browsable(false)]
+        [XmlIgnore()]
+        public Series<double> DeltasHigh
+        {
+            get { return delta_high; }
+        }
+
+        [Browsable(false)]
+        [XmlIgnore()]
+        public Series<double> DeltasClose
+        {
+            get { return delta_close; }
+        }
+
+        [Browsable(false)]
+        [XmlIgnore()]
+        public Series<double> DeltasLow
+        {
+            get { return delta_low; }
+        }
+
+        #endregion
+
+    }
+}
+
+#region NinjaScript generated code. Neither change nor remove.
+
+namespace NinjaTrader.NinjaScript.Indicators
+{
+	public partial class Indicator : NinjaTrader.Gui.NinjaScript.IndicatorRenderBase
+	{
+		private Deltagilvan[] cacheDeltagilvan;
+		public Deltagilvan Deltagilvan(Brush barColorDown, Brush barColorUp, Brush shadowColor, int shadowWidth, bool cumulativeDelta, int minSize, bool showDivs, int bBPeriod, double bBStdDev, bool showBollingerBands, int eMAPeriod, bool showEMA, Brush colorAboveUpperBand, Brush colorBelowLowerBand, Brush colorInsideBands, bool applyColoringToPriceChart, bool applyColoringToIndicator)
+		{
+			return Deltagilvan(Input, barColorDown, barColorUp, shadowColor, shadowWidth, cumulativeDelta, minSize, showDivs, bBPeriod, bBStdDev, showBollingerBands, eMAPeriod, showEMA, colorAboveUpperBand, colorBelowLowerBand, colorInsideBands, applyColoringToPriceChart, applyColoringToIndicator);
+		}
+
+		public Deltagilvan Deltagilvan(ISeries<double> input, Brush barColorDown, Brush barColorUp, Brush shadowColor, int shadowWidth, bool cumulativeDelta, int minSize, bool showDivs, int bBPeriod, double bBStdDev, bool showBollingerBands, int eMAPeriod, bool showEMA, Brush colorAboveUpperBand, Brush colorBelowLowerBand, Brush colorInsideBands, bool applyColoringToPriceChart, bool applyColoringToIndicator)
+		{
+			if (cacheDeltagilvan != null)
+				for (int idx = 0; idx < cacheDeltagilvan.Length; idx++)
+					if (cacheDeltagilvan[idx] != null && cacheDeltagilvan[idx].BarColorDown == barColorDown && cacheDeltagilvan[idx].BarColorUp == barColorUp && cacheDeltagilvan[idx].ShadowColor == shadowColor && cacheDeltagilvan[idx].ShadowWidth == shadowWidth && cacheDeltagilvan[idx].CumulativeDelta == cumulativeDelta && cacheDeltagilvan[idx].MinSize == minSize && cacheDeltagilvan[idx].ShowDivs == showDivs && cacheDeltagilvan[idx].BBPeriod == bBPeriod && cacheDeltagilvan[idx].BBStdDev == bBStdDev && cacheDeltagilvan[idx].ShowBollingerBands == showBollingerBands && cacheDeltagilvan[idx].EMAPeriod == eMAPeriod && cacheDeltagilvan[idx].ShowEMA == showEMA && cacheDeltagilvan[idx].ColorAboveUpperBand == colorAboveUpperBand && cacheDeltagilvan[idx].ColorBelowLowerBand == colorBelowLowerBand && cacheDeltagilvan[idx].ColorInsideBands == colorInsideBands && cacheDeltagilvan[idx].ApplyColoringToPriceChart == applyColoringToPriceChart && cacheDeltagilvan[idx].ApplyColoringToIndicator == applyColoringToIndicator && cacheDeltagilvan[idx].EqualsInput(input))
+						return cacheDeltagilvan[idx];
+			return CacheIndicator<Deltagilvan>(new Deltagilvan(){ BarColorDown = barColorDown, BarColorUp = barColorUp, ShadowColor = shadowColor, ShadowWidth = shadowWidth, CumulativeDelta = cumulativeDelta, MinSize = minSize, ShowDivs = showDivs, BBPeriod = bBPeriod, BBStdDev = bBStdDev, ShowBollingerBands = showBollingerBands, EMAPeriod = eMAPeriod, ShowEMA = showEMA, ColorAboveUpperBand = colorAboveUpperBand, ColorBelowLowerBand = colorBelowLowerBand, ColorInsideBands = colorInsideBands, ApplyColoringToPriceChart = applyColoringToPriceChart, ApplyColoringToIndicator = applyColoringToIndicator }, input, ref cacheDeltagilvan);
+		}
+	}
+}
+
+namespace NinjaTrader.NinjaScript.MarketAnalyzerColumns
+{
+	public partial class MarketAnalyzerColumn : MarketAnalyzerColumnBase
+	{
+		public Indicators.Deltagilvan Deltagilvan(Brush barColorDown, Brush barColorUp, Brush shadowColor, int shadowWidth, bool cumulativeDelta, int minSize, bool showDivs, int bBPeriod, double bBStdDev, bool showBollingerBands, int eMAPeriod, bool showEMA, Brush colorAboveUpperBand, Brush colorBelowLowerBand, Brush colorInsideBands, bool applyColoringToPriceChart, bool applyColoringToIndicator)
+		{
+			return indicator.Deltagilvan(Input, barColorDown, barColorUp, shadowColor, shadowWidth, cumulativeDelta, minSize, showDivs, bBPeriod, bBStdDev, showBollingerBands, eMAPeriod, showEMA, colorAboveUpperBand, colorBelowLowerBand, colorInsideBands, applyColoringToPriceChart, applyColoringToIndicator);
+		}
+
+		public Indicators.Deltagilvan Deltagilvan(ISeries<double> input , Brush barColorDown, Brush barColorUp, Brush shadowColor, int shadowWidth, bool cumulativeDelta, int minSize, bool showDivs, int bBPeriod, double bBStdDev, bool showBollingerBands, int eMAPeriod, bool showEMA, Brush colorAboveUpperBand, Brush colorBelowLowerBand, Brush colorInsideBands, bool applyColoringToPriceChart, bool applyColoringToIndicator)
+		{
+			return indicator.Deltagilvan(input, barColorDown, barColorUp, shadowColor, shadowWidth, cumulativeDelta, minSize, showDivs, bBPeriod, bBStdDev, showBollingerBands, eMAPeriod, showEMA, colorAboveUpperBand, colorBelowLowerBand, colorInsideBands, applyColoringToPriceChart, applyColoringToIndicator);
+		}
+	}
+}
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+	public partial class Strategy : NinjaTrader.Gui.NinjaScript.StrategyRenderBase
+	{
+		public Indicators.Deltagilvan Deltagilvan(Brush barColorDown, Brush barColorUp, Brush shadowColor, int shadowWidth, bool cumulativeDelta, int minSize, bool showDivs, int bBPeriod, double bBStdDev, bool showBollingerBands, int eMAPeriod, bool showEMA, Brush colorAboveUpperBand, Brush colorBelowLowerBand, Brush colorInsideBands, bool applyColoringToPriceChart, bool applyColoringToIndicator)
+		{
+			return indicator.Deltagilvan(Input, barColorDown, barColorUp, shadowColor, shadowWidth, cumulativeDelta, minSize, showDivs, bBPeriod, bBStdDev, showBollingerBands, eMAPeriod, showEMA, colorAboveUpperBand, colorBelowLowerBand, colorInsideBands, applyColoringToPriceChart, applyColoringToIndicator);
+		}
+
+		public Indicators.Deltagilvan Deltagilvan(ISeries<double> input , Brush barColorDown, Brush barColorUp, Brush shadowColor, int shadowWidth, bool cumulativeDelta, int minSize, bool showDivs, int bBPeriod, double bBStdDev, bool showBollingerBands, int eMAPeriod, bool showEMA, Brush colorAboveUpperBand, Brush colorBelowLowerBand, Brush colorInsideBands, bool applyColoringToPriceChart, bool applyColoringToIndicator)
+		{
+			return indicator.Deltagilvan(input, barColorDown, barColorUp, shadowColor, shadowWidth, cumulativeDelta, minSize, showDivs, bBPeriod, bBStdDev, showBollingerBands, eMAPeriod, showEMA, colorAboveUpperBand, colorBelowLowerBand, colorInsideBands, applyColoringToPriceChart, applyColoringToIndicator);
+		}
+	}
+}
+
+#endregion
